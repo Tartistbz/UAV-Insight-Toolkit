@@ -1,0 +1,6 @@
+pymavlink
+pandas
+streamlit
+plotly
+numpy
+watchdog
