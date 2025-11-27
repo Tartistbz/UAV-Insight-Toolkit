@@ -3,10 +3,21 @@ import pandas as pd
 import plotly.express as px
 import os
 import sys
+import tempfile
+import shutil
 
-current_dir = os.path.dirname(os.path.abspath(__file__))
-root_dir = os.path.dirname(current_dir)
-sys.path.append(root_dir)
+# --- 路径黑魔法 (适配 IDE 和 EXE) ---
+if getattr(sys, 'frozen', False):
+    # 如果是打包后的 exe，根目录应该是 exe 所在的文件夹
+    # 这样用户只要在 exe 旁边建一个 data 文件夹，程序就能读到
+    base_dir = os.path.dirname(sys.executable)
+    # 临时解压目录 (用于寻找内部的 analyzer 包)
+    internal_root = sys._MEIPASS
+    sys.path.append(os.path.join(internal_root, 'src')) # 确保能 import
+else:
+    # 正常 IDE 运行
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sys.path.append(base_dir)
 
 from src.analyzer.ardu_parser import ArduPilotParser
 
@@ -17,29 +28,45 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 侧边栏：文件选择 ---
+# --- 侧边栏逻辑 ---
 st.sidebar.title("✈️ UAV Log Analysis")
-st.sidebar.markdown("选择或上传你的日志文件")
 
-# 自动扫描 data 目录下的 .bin 文件
-data_dir = os.path.join(root_dir, 'data')
+# 方式 1: 直接上传
+uploaded_file = st.sidebar.file_uploader("📂 方法一: 点击上传日志 (.bin)", type=["bin"])
+
+# 方式 2: 扫描 exe 旁边的 data 文件夹
+st.sidebar.markdown("---")
+st.sidebar.markdown("📂 **方法二: 选择 data/ 目录下的文件**")
+
+data_dir = os.path.join(base_dir, 'data')
 if not os.path.exists(data_dir):
-    os.makedirs(data_dir)
+    log_files = []
+else:
+    log_files = [f for f in os.listdir(data_dir) if f.endswith('.bin')]
 
-# 获取所有 bin 文件
-log_files = [f for f in os.listdir(data_dir) if f.endswith('.bin')]
-
-selected_file = st.sidebar.selectbox(
-    "选择示例日志 (data/ 目录):",
-    options=log_files
+selected_from_folder = st.sidebar.selectbox(
+    "从列表中选择:",
+    options=log_files,
+    index=0 if log_files else None,
+    help="请在 exe 文件旁边新建一个名为 data 的文件夹，放入日志后重启软件即可看到。"
 )
 
+# --- 统一文件入口逻辑 ---
+target_path = None
+
+if uploaded_file is not None:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as tmp_file:
+        tmp_file.write(uploaded_file.getvalue())
+        target_path = tmp_file.name
+    st.sidebar.success(f"已加载上传文件: {uploaded_file.name}")
+
+elif selected_from_folder:
+    target_path = os.path.join(data_dir, selected_from_folder)
 # --- 主界面 ---
 st.title("无人机飞行数据分析看板")
 
-if selected_file:
-    file_path = os.path.join(data_dir, selected_file)
-    st.write(f"正在分析: **{selected_file}** ...")
+if target_path:
+    st.write(f"正在分析日志 ...")
 
 
     # 1. 解析数据
@@ -51,7 +78,7 @@ if selected_file:
 
 
     try:
-        df_raw = load_data(file_path)
+        df_raw = load_data(target_path)
 
         if df_raw.empty:
             st.error("日志解析为空，请检查文件内容。")
