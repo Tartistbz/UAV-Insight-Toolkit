@@ -86,7 +86,7 @@ Contributions are welcome! Please fork the repository and submit a Pull Request.
 
 ## 📄 License
 
-Distributed under the MIT License. See `LICENSE` for more information.
+Distributed under the GNU General Public License v3.0. See `LICENSE` for more information.
 
 ## 📸 Dashboard Preview
 
