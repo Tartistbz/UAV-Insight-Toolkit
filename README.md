@@ -62,8 +62,7 @@ pip install -r requirements.txt
 To use the AI Diagnostics feature, you need a ZhipuAI API Key.
 
 1. Get your key from the [ZhipuAI Open Platform](https://bigmodel.cn/).
-2. **Method A (GUI):** Enter the key in the sidebar and click "Verify".
-3. **Method B (File):** Create a file named `apikey.txt` in the root directory and paste your key there (this file is Git-ignored).
+2. **Method (GUI):** Enter the key in the sidebar and click "Verify".
 
 ### 3. Usage
 
