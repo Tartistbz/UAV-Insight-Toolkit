@@ -1,25 +1,24 @@
 import streamlit as st
-import pandas as pd
 import plotly.express as px
 import os
 import sys
 import tempfile
-import shutil
+import time
+from zai import ZhipuAiClient
 
 # --- 路径黑魔法 (适配 IDE 和 EXE) ---
 if getattr(sys, 'frozen', False):
     # 如果是打包后的 exe，根目录应该是 exe 所在的文件夹
-    # 这样用户只要在 exe 旁边建一个 data 文件夹，程序就能读到
     base_dir = os.path.dirname(sys.executable)
     # 临时解压目录 (用于寻找内部的 analyzer 包)
     internal_root = sys._MEIPASS
-    sys.path.append(os.path.join(internal_root, 'src')) # 确保能 import
+    sys.path.append(os.path.join(internal_root, 'src'))
 else:
     # 正常 IDE 运行
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     sys.path.append(base_dir)
 
-from src.analyzer.ardu_parser import ArduPilotParser
+from analyzer.ardu_parser import ArduPilotParser
 
 # --- 页面配置 ---
 st.set_page_config(
@@ -28,16 +27,92 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- 侧边栏逻辑 ---
+# --- [新增] AI 侧边栏配置逻辑 ---
 st.sidebar.title("✈️ UAV Log Analysis")
 
+
+# 1. 定义弹窗函数 (使用 @st.dialog 装饰器 - Streamlit 1.34+)
+@st.dialog("🚫 API Key 验证失败")
+def show_error_dialog(error_type, error_msg):
+    st.error(f"错误类型: {error_type}")
+    st.markdown(f"**详细信息:**\n\n{error_msg}")
+    st.info("请检查 Key 是否复制完整，或网络是否通畅。")
+    if st.button("知道了"):
+        st.rerun()
+
+
+# 2. 定义验证函数
+def verify_key(key):
+    """验证 Key 的格式和有效性"""
+    key = key.strip()
+
+    # 检查 1: 是否为空
+    if not key:
+        return False, "EmptyError", "输入框是空的！请粘贴您的 API Key。"
+
+    # 检查 2: 格式 (智谱Key通常较长且包含点号)
+    if len(key) < 20:
+        return False, "FormatError", "Key 的长度似乎不够，您可能只复制了一部分。"
+
+    # 检查 3: 尝试建立一个真实的连接 (轻量级测试)
+    try:
+        # 尝试初始化客户端 (不消耗 token，只检查连通性)
+        client = ZhipuAiClient(api_key=key)
+        # 这里我们不做实际请求，只要 Client 初始化没报错，格式基本是对的
+        return True, "Success", key
+    except Exception as e:
+        return False, "ConnectionError", f"SDK 初始化失败: {str(e)}"
+
+
+# 3. AI 配置区域
+st.sidebar.markdown("---")
+st.sidebar.subheader("🤖 AI 配置")
+
+# 使用 st.form 隔离输入框，回车不会刷新
+with st.sidebar.form(key="apikey_form"):
+    # 从 session_state 获取默认值
+    default_val = st.session_state.get("zhipu_api_key", "")
+
+    user_input_key = st.text_input(
+        "🔑 请输入/粘贴 GLM API Key",
+        value=default_val,
+        type="password",
+        help="粘贴后请点击下方的确认按钮"
+    )
+
+    # 确认按钮
+    submit_button = st.form_submit_button("✅ 确认并验证 Key")
+
+# 处理按钮点击逻辑
+if submit_button:
+    is_valid, err_type, result = verify_key(user_input_key)
+
+    if is_valid:
+        st.session_state.zhipu_api_key = result
+        st.sidebar.success("🎉 验证成功！Key 已保存。")
+        time.sleep(0.5)
+        st.rerun()
+    else:
+        show_error_dialog(err_type, result)
+
+# 获取最终可用的 Key
+api_key = st.session_state.get("zhipu_api_key", "")
+
+# 显示当前状态
+if api_key:
+    st.sidebar.caption(f"当前状态: ✅ 已加载 (尾号 {api_key[-4:]})")
+else:
+    st.sidebar.caption("当前状态: ⚪ 未配置")
+
+# --- 日志文件选择逻辑 ---
+st.sidebar.markdown("---")
+st.sidebar.subheader("📂 日志加载")
+
 # 方式 1: 直接上传
-uploaded_file = st.sidebar.file_uploader("📂 方法一: 点击上传日志 (.bin)", type=["bin"])
+uploaded_file = st.sidebar.file_uploader("点击上传日志 (.bin)", type=["bin"])
 
 # 方式 2: 扫描 exe 旁边的 data 文件夹
-st.sidebar.markdown("---")
-st.sidebar.markdown("📂 **方法二: 选择 data/ 目录下的文件**")
-
+st.sidebar.markdown("**或选择 data/ 目录下的文件:**")
 data_dir = os.path.join(base_dir, 'data')
 if not os.path.exists(data_dir):
     log_files = []
@@ -48,7 +123,7 @@ selected_from_folder = st.sidebar.selectbox(
     "从列表中选择:",
     options=log_files,
     index=0 if log_files else None,
-    help="请在 exe 文件旁边新建一个名为 data 的文件夹，放入日志后重启软件即可看到。"
+    label_visibility="collapsed"
 )
 
 # --- 统一文件入口逻辑 ---
@@ -58,10 +133,11 @@ if uploaded_file is not None:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as tmp_file:
         tmp_file.write(uploaded_file.getvalue())
         target_path = tmp_file.name
-    st.sidebar.success(f"已加载上传文件: {uploaded_file.name}")
+    st.sidebar.success(f"已加载: {uploaded_file.name}")
 
 elif selected_from_folder:
     target_path = os.path.join(data_dir, selected_from_folder)
+
 # --- 主界面 ---
 st.title("无人机飞行数据分析看板")
 
@@ -69,12 +145,79 @@ if target_path:
     st.write(f"正在分析日志 ...")
 
 
-    # 1. 解析数据
-    # 使用缓存装饰器，避免每次刷新页面都重新读文件
+    # 1. 解析数据函数
     @st.cache_data
     def load_data(path):
         parser = ArduPilotParser(path)
         return parser.get_dataframe()
+
+
+    def generate_ai_prompt(df):
+        """
+        [升级版] 生成包含时序特征的详细摘要
+        """
+        # 1. 基础统计
+        duration = df['timestamp'].max() - df['timestamp'].min()
+        max_alt = df['relative_alt'].max() if 'relative_alt' in df else 0
+
+        summary = f"【飞行概况】\n飞行时长: {duration:.1f}秒\n最大相对高度: {max_alt:.1f}米\n"
+
+        # 2. 震动深度分析 (增加时间上下文)
+        if 'vibe_x' in df:
+            # 找到震动最大的那一行的索引
+            max_vibe_idx = df['vibe_x'].idxmax()
+            max_vibe_row = df.loc[max_vibe_idx]
+
+            max_vibe = max_vibe_row['vibe_x']
+            max_vibe_time = max_vibe_row['timestamp'] - df['timestamp'].min()  # 相对时间
+            max_vibe_alt = max_vibe_row['relative_alt'] if 'relative_alt' in max_vibe_row else 0
+
+            avg_vibe = df[['vibe_x', 'vibe_y', 'vibe_z']].mean().mean()
+
+            clip_cols = [c for c in ['clip_0', 'clip_1', 'clip_2'] if c in df]
+            total_clips = df[clip_cols].max().sum() if clip_cols else 0
+
+            summary += f"\n【震动事件分析】\n"
+            summary += f"- 峰值时刻: T+{max_vibe_time:.1f}秒 (高度 {max_vibe_alt:.1f}m)\n"
+            summary += f"- 峰值强度: {max_vibe:.2f} m/s² (阈值30)\n"
+            summary += f"- 平均强度: {avg_vibe:.2f} m/s²\n"
+            summary += f"- 削顶(Clipping): {total_clips}次\n"
+            # [新增] PID 详细统计
+        if 'rate_roll' in df and 'rate_roll_des' in df:
+            # 计算误差 (Error = Desired - Actual)
+            # 使用 abs().mean() 计算平均绝对误差 (MAE)
+            roll_mae = (df['rate_roll_des'] - df['rate_roll']).abs().mean()
+            pitch_mae = (df['rate_pitch_des'] - df['rate_pitch']).abs().mean()
+            yaw_mae = (df['rate_yaw_des'] - df['rate_yaw']).abs().mean()
+
+            summary += f"\n【PID控制质量】\n"
+            summary += f"Roll轴平均跟踪误差: {roll_mae:.2f} deg/s\n"
+            summary += f"Pitch轴平均跟踪误差: {pitch_mae:.2f} deg/s\n"
+            summary += f"Yaw轴平均跟踪误差: {yaw_mae:.2f} deg/s\n"
+            summary += "(提示: 误差越小越好。如果误差大且伴随震荡，可能是P/D参数过大；如果误差大且滞后，可能是P/I参数过小。)\n"
+
+        # 3. 构建时序趋势 (Downsampling)
+        # 为了不撑爆 token，我们把整个日志压缩成约 20-30 个关键点
+        # 例如：总共 1000 行，我们每隔 50 行取一个点
+        step = max(1, len(df) // 30)
+        sampled_df = df.iloc[::step].copy()
+
+        # 将绝对时间戳转换为相对时间 (T+xx秒)
+        start_time = df['timestamp'].min()
+        sampled_df['time_rel'] = sampled_df['timestamp'] - start_time
+
+        summary += "\n【飞行趋势快照 (时间,高度,震动,横滚)】\n"
+        summary += "Time(s), Alt(m), Vibe(m/s²), Roll(deg)\n"
+
+        for _, row in sampled_df.iterrows():
+            # 这里的字段名要和 df_clean 里的一致
+            t = f"{row['time_rel']:.1f}"
+            a = f"{row['relative_alt']:.1f}" if 'relative_alt' in row else "0"
+            v = f"{row['vibe_x']:.1f}" if 'vibe_x' in row else "0"
+            r = f"{row['roll']:.1f}" if 'roll' in row else "0"
+            summary += f"{t}, {a}, {v}, {r}\n"
+
+        return summary
 
 
     try:
@@ -83,30 +226,27 @@ if target_path:
         if df_raw.empty:
             st.error("日志解析为空，请检查文件内容。")
         else:
-            # --- 2. 数据清洗  ---
-            # 使用前向填充 (ffill) 填补 NaN，让 GPS 和 ATT 数据在时间轴上对齐
+            # --- 2. 数据清洗 ---
             df_clean = df_raw.set_index('timestamp').ffill().reset_index()
-            # 模拟 GLOBAL_POSITION_INT 的 relative_alt 计算
-            if 'alt' in df_clean.columns:
-                # 1. 找到起飞点的海拔 (Home Altitude)
-                home_alt = df_clean['alt'].iloc[:50].mean()
 
-                # 2. 计算相对高度 (单位: 米)
+            if 'alt' in df_clean.columns:
+                home_alt = df_clean['alt'].iloc[:50].mean()
                 df_clean['relative_alt'] = df_clean['alt'] - home_alt
             else:
                 df_clean['relative_alt'] = 0
+
+            # --- 3. 关键指标 ---
             col1, col2, col3 = st.columns(3)
             with col1:
                 st.metric("飞行时长", f"{df_clean['timestamp'].max() - df_clean['timestamp'].min():.1f} s")
             with col2:
-                max_alt = df_clean['alt'].max() if 'alt' in df_clean else 0
-                st.metric("最大高度 (Rel)", f"{max_alt:.1f} m")
+                max_rel_alt = df_clean['relative_alt'].max()
+                st.metric("最大相对高度", f"{max_rel_alt:.1f} m")
             with col3:
                 st.metric("数据点总数", len(df_clean))
 
             # --- 4. 绘图区域 ---
-            tab1, tab2, tab3 = st.tabs(["📈 姿态分析", "🌍 3D 轨迹", "⚠️ 震动诊断"])
-
+            tab1, tab2, tab3, tab4 = st.tabs(["📈 姿态分析", "🌍 3D 轨迹", "⚠️ 震动诊断", "🔧 PID 调优"])
             with tab1:
                 st.subheader("姿态响应分析 (Attitude)")
                 if 'roll' in df_clean.columns:
@@ -123,7 +263,6 @@ if target_path:
             with tab2:
                 st.subheader("3D 飞行轨迹 (Relative Alt)")
                 if 'lat' in df_clean.columns and 'lon' in df_clean.columns:
-                    # 降采样防止卡顿
                     df_traj = df_clean.iloc[::10, :]
                     fig_traj = px.scatter_3d(
                         df_traj,
@@ -138,8 +277,6 @@ if target_path:
 
             with tab3:
                 st.subheader("机身震动水平 (Vibration Levels)")
-
-                # 只有当 clip_0 在列名中时，才去计算 max()，否则会报 KeyError
                 has_vibe_data = 'vibe_x' in df_clean.columns
                 has_clip_data = 'clip_0' in df_clean.columns
 
@@ -151,7 +288,6 @@ if target_path:
                     - ❌ **危险:** > 30 m/s²
                     """)
 
-                    # 1. 绘制震动曲线
                     fig_vibe = px.line(
                         df_clean,
                         x='timestamp',
@@ -166,7 +302,6 @@ if target_path:
                     if has_clip_data:
                         cols = ['clip_0', 'clip_1', 'clip_2']
                         valid_cols = [c for c in cols if c in df_clean.columns]
-
                         if valid_cols:
                             total_clips = df_clean[valid_cols].max().sum()
                             if total_clips > 0:
@@ -175,9 +310,129 @@ if target_path:
                                 st.success("✅ 传感器工作正常，未检测到削顶 (No Clipping)。")
                     else:
                         st.info("ℹ️ 当前日志不包含 Clipping 记录字段。")
+                else:
+                    st.warning("⚠️ 当前日志未包含震动数据 (VIBE 消息)。")
+            with tab4:
+                st.subheader("角速度响应分析 (Rate Controller)")
+
+                # 检查是否有数据
+                if 'rate_roll' in df_clean.columns:
+                    st.markdown("""
+                    **如何分析：**
+                    - 🔴 **红色线 (Desired):** 飞控“想要”达到的转速。
+                    - 🔵 **蓝色线 (Actual):** 无人机“实际”的转速。
+                    - **完美状态：** 红蓝两线完全重合。
+                    - **滞后：** 蓝线总是在红线后面 -> 需增大 P 或 I。
+                    - **震荡：** 蓝线在红线上下剧烈抖动 -> 需减小 P 或 D。
+                    """)
+
+                    # 1. 选择轴向 (Radio Button)
+                    axis = st.radio("选择分析轴向:", ["Roll (横滚)", "Pitch (俯仰)", "Yaw (航向)"], horizontal=True)
+
+                    # 2. 准备绘图数据
+                    if "Roll" in axis:
+                        y_cols = ['rate_roll_des', 'rate_roll']
+                        title = "Roll Rate: Desired vs Actual"
+                        # 计算当前轴的误差
+                        mae = (df_clean['rate_roll_des'] - df_clean['rate_roll']).abs().mean()
+                    elif "Pitch" in axis:
+                        y_cols = ['rate_pitch_des', 'rate_pitch']
+                        title = "Pitch Rate: Desired vs Actual"
+                        mae = (df_clean['rate_pitch_des'] - df_clean['rate_pitch']).abs().mean()
+                    else:
+                        y_cols = ['rate_yaw_des', 'rate_yaw']
+                        title = "Yaw Rate: Desired vs Actual"
+                        mae = (df_clean['rate_yaw_des'] - df_clean['rate_yaw']).abs().mean()
+
+                    # 显示误差指标
+                    st.metric(f"{axis.split()[0]} 平均跟踪误差 (MAE)", f"{mae:.2f} deg/s")
+
+                    # 3. 绘制交互式图表
+                    # 这里的技巧是指定颜色 map，让 Desired 永远是红色，Actual 永远是蓝色
+                    color_map = {y_cols[0]: 'red', y_cols[1]: 'blue'}
+
+                    fig_pid = px.line(
+                        df_clean,
+                        x='timestamp',
+                        y=y_cols,
+                        title=title,
+                        color_discrete_map=color_map,  # 固定颜色
+                        labels={'value': '角速度 (deg/s)', 'timestamp': '时间 (s)', 'variable': '信号'}
+                    )
+
+                    # 允许局部缩放
+                    fig_pid.update_traces(line=dict(width=1.5))
+                    st.plotly_chart(fig_pid, use_container_width=True)
 
                 else:
-                    st.warning("⚠️ 当前日志未包含震动数据 (VIBE 消息)。可能是飞控参数 LOG_BITMASK 未开启震动记录。")
+                    st.warning("⚠️ 当前日志未包含 RATE 消息。请检查飞控参数 LOG_BITMASK。")
+            # --- [AI 智能分析模块] ---
+            st.markdown("---")
+            st.subheader("🤖 AI 飞行诊断 (Powered by GLM-4.5)")
+
+            col_ai_1, col_ai_2 = st.columns([1, 2])
+
+            with col_ai_1:
+                st.info("📊 **发送给 AI 的数据摘要:**")
+                prompt_summary = generate_ai_prompt(df_clean)
+                st.code(prompt_summary, language="text")
+
+            with col_ai_2:
+                if st.button("🚀 开始 AI 诊断"):
+                    if not api_key:
+                        st.error("请先在侧边栏配置并验证 API Key！")
+                    else:
+                        try:
+                            # 1. 占位符策略：先创建一个空容器
+                            response_container = st.empty()
+
+                            # 2. 立即显示“思考中”的状态 (填补空窗期)
+                            # 使用 info 框，看起来更显眼，不会是一片白
+                            response_container.info("🧠 GLM-4.5 正在阅读时序数据并进行推理，请稍候...")
+
+                            client = ZhipuAiClient(api_key=api_key)
+
+                            messages = [
+                                {"role": "system",
+                                 "content": """你是一位专业的无人机飞控专家。用户会提供一份包含“统计摘要”和“时序趋势快照”的飞行数据。
+                                    请基于这些数据进行深度推理，而不仅仅是复述数字。
+                                    分析要求：
+                                    1. **结合时空上下文**：分析震动峰值发生的时间点。
+                                    2. **关联分析**：观察“飞行趋势快照”，看震动变大时，姿态（Roll）或高度（Alt）是否有剧烈变化？
+                                    3. **给出专业判断**。
+                                    请输出格式清晰的诊断报告。"""},
+                                {"role": "user", "content": prompt_summary}
+                            ]
+
+                            full_response = ""
+
+                            # 3. 发起请求 (此时界面上还显示着 "正在阅读...")
+                            response = client.chat.completions.create(
+                                model="glm-4.5-flash",
+                                messages=messages,
+                                stream=True,
+                                max_tokens=2048,
+                                temperature=0.7
+                            )
+
+                            # 4. 流式接收
+                            # 这个循环开始执行，意味着 AI 开始说话了
+                            for chunk in response:
+                                if chunk.choices and chunk.choices[0].delta.content:
+                                    content = chunk.choices[0].delta.content
+                                    full_response += content
+
+                                    # 5. 【关键一步】实时覆盖
+                                    # 用累积的文字直接替换掉上面的 response_container.info(...)
+                                    # 视觉上就是：蓝色的“思考中”突然变成了打字机文字，没有任何空白
+                                    response_container.markdown(full_response + "▌")
+
+                            # 最后去掉光标
+                            response_container.markdown(full_response)
+
+                        except Exception as e:
+                            # 如果出错，也在这个容器里显示错误
+                            response_container.error(f"AI 分析请求失败: {e}")
 
     except Exception as e:
         st.error(f"解析出错: {e}")
