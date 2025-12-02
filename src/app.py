@@ -410,8 +410,11 @@ if target_path:
                             response = client.chat.completions.create(
                                 model="glm-4.5-flash",
                                 messages=messages,
+                                thinking={
+                                    "type": "enabled",  # bu启用深度思考模式
+                                },
                                 stream=True,
-                                max_tokens=2048,
+                                max_tokens=4096,
                                 temperature=0.7
                             )
 
