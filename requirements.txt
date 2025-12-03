@@ -6,3 +6,4 @@ numpy
 watchdog
 zai-sdk>=0.0.4
 sniffio
+pyulog
