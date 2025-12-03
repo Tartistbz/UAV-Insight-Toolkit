@@ -5,8 +5,6 @@ import sys
 import tempfile
 import time
 from zai import ZhipuAiClient
-
-# --- 路径黑魔法 (适配 IDE 和 EXE) ---
 if getattr(sys, 'frozen', False):
     # 如果是打包后的 exe，根目录应该是 exe 所在的文件夹
     base_dir = os.path.dirname(sys.executable)
@@ -17,9 +15,8 @@ else:
     # 正常 IDE 运行
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     sys.path.append(base_dir)
-
 from analyzer.ardu_parser import ArduPilotParser
-
+from analyzer.px4_parser import PX4Parser
 # --- 页面配置 ---
 st.set_page_config(
     page_title="UAV Insight Toolkit",
@@ -27,7 +24,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- [新增] AI 侧边栏配置逻辑 ---
+# ---  AI 侧边栏配置逻辑 ---
 st.sidebar.title("✈️ UAV Log Analysis")
 
 
@@ -40,6 +37,15 @@ def show_error_dialog(error_type, error_msg):
     if st.button("知道了"):
         st.rerun()
 
+
+def get_raw_curve(df, col_name):
+    """
+    只保留数值发生变化的时刻，消除 ffill 带来的'阶梯/方波'效应
+    """
+    # 1. 计算差分，找出值发生变化的行
+    # fillna(1) 是为了保留第一个点 (diff是NaN)
+    mask = df[col_name].diff().fillna(1) != 0
+    return df[mask]
 
 # 2. 定义验证函数
 def verify_key(key):
@@ -109,7 +115,7 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("📂 日志加载")
 
 # 方式 1: 直接上传
-uploaded_file = st.sidebar.file_uploader("点击上传日志 (.bin)", type=["bin"])
+uploaded_file = st.sidebar.file_uploader("点击上传日志 (.bin / .ulg)", type=["bin", "ulg"])
 
 # 方式 2: 扫描 exe 旁边的 data 文件夹
 st.sidebar.markdown("**或选择 data/ 目录下的文件:**")
@@ -117,7 +123,7 @@ data_dir = os.path.join(base_dir, 'data')
 if not os.path.exists(data_dir):
     log_files = []
 else:
-    log_files = [f for f in os.listdir(data_dir) if f.endswith('.bin')]
+    log_files = [f for f in os.listdir(data_dir) if f.endswith('.bin') or f.endswith('.ulg')]
 
 selected_from_folder = st.sidebar.selectbox(
     "从列表中选择:",
@@ -130,7 +136,15 @@ selected_from_folder = st.sidebar.selectbox(
 target_path = None
 
 if uploaded_file is not None:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as tmp_file:
+    # 动态获取原始文件的后缀名 (.bin 或 .ulg)
+    # 这样 load_data 才能正确识别并调用 PX4Parser
+    file_ext = os.path.splitext(uploaded_file.name)[1]
+
+    # 默认兜底
+    if not file_ext:
+        file_ext = ".bin"
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp_file:
         tmp_file.write(uploaded_file.getvalue())
         target_path = tmp_file.name
     st.sidebar.success(f"已加载: {uploaded_file.name}")
@@ -148,7 +162,10 @@ if target_path:
     # 1. 解析数据函数
     @st.cache_data
     def load_data(path):
-        parser = ArduPilotParser(path)
+        if path.endswith('.ulg'):
+            parser = PX4Parser(path)
+        else:
+            parser = ArduPilotParser(path)
         return parser.get_dataframe()
 
 
@@ -228,11 +245,20 @@ if target_path:
         else:
             # --- 2. 数据清洗 ---
             df_clean = df_raw.set_index('timestamp').ffill().reset_index()
-
             if 'alt' in df_clean.columns:
+                # 方案 A: 有 GPS，使用 GPS 高度 (AMSL) 计算相对高度
                 home_alt = df_clean['alt'].iloc[:50].mean()
                 df_clean['relative_alt'] = df_clean['alt'] - home_alt
+
+            elif 'loc_z' in df_clean.columns:
+                # 方案 B: 没 GPS，使用局部位置 Z (NED 坐标系)
+                # 注意: PX4 的 Local Z 轴向下为正，所以高度 = -Z
+                # 我们也取个初始偏移量，防止数据没归零
+                start_z = df_clean['loc_z'].iloc[:50].mean()
+                df_clean['relative_alt'] = -(df_clean['loc_z'] - start_z)
+
             else:
+                # 方案 C: 啥都没有
                 df_clean['relative_alt'] = 0
 
             # --- 3. 关键指标 ---
@@ -260,21 +286,89 @@ if target_path:
                 else:
                     st.warning("未检测到姿态数据")
 
+                    # --- [更新] Tab 2: 定位综合分析 ---
             with tab2:
-                st.subheader("3D 飞行轨迹 (Relative Alt)")
+                # 逻辑: 优先画 GPS，如果没有 GPS 但有局部位置(光流/IMU)，则画局部轨迹
+                st.subheader("1. 3D 飞行轨迹")
                 if 'lat' in df_clean.columns and 'lon' in df_clean.columns:
+                    st.caption("数据源: Global GPS (WGS84)")
                     df_traj = df_clean.iloc[::10, :]
                     fig_traj = px.scatter_3d(
                         df_traj,
                         x='lat', y='lon', z='relative_alt',
                         color='relative_alt',
-                        size_max=5,
-                        opacity=0.7
+                        size_max=5, opacity=0.7,
+                        title="GPS 3D 轨迹",
+                        height=800
                     )
                     st.plotly_chart(fig_traj, use_container_width=True)
-                else:
-                    st.warning("未检测到 GPS 数据")
+                elif 'loc_x' in df_clean.columns and 'loc_y' in df_clean.columns:
+                    st.caption("数据源: Local Position NED (Local Frame)")
+                    st.info("💡 未检测到 GPS，正在显示基于 NED 坐标系的局部轨迹 (例如光流/视觉定位)。")
 
+                    df_traj = df_clean.iloc[::10, :]
+                    # 绘制局部轨迹
+                    fig_traj = px.scatter_3d(
+                        df_traj,
+                        x='loc_x', y='loc_y', z='relative_alt',
+                        color='relative_alt',
+                        size_max=5, opacity=0.7,
+                        title="Local NED 轨迹 (无 GPS)",
+                        height=800
+                    )
+                    st.plotly_chart(fig_traj, use_container_width=True)
+
+                else:
+                    st.warning("⚠️ 未检测到位置数据 (GPS 或 Local Position)。无法绘制轨迹。")
+
+                # --- 第二部分: 光流传感器分析 ---
+                st.markdown("---")  # 分割线
+                st.subheader("2. 光流/室内定位分析 (Optical Flow)")
+
+                # 检查是否存在光流数据 (基于 px4_parser 解析的字段)
+                if 'flow_quality' in df_clean.columns:
+
+                    # 布局：左边看质量，右边看流量
+                    col_flow_1, col_flow_2 = st.columns(2)
+
+                    with col_flow_1:
+                        st.markdown("**信号质量 (Quality)**")
+                        st.caption("范围 0-255。低于 100 通常无法定点。")
+
+                        # [修改] 使用去重后的数据画图
+                        df_qual_raw = get_raw_curve(df_clean, 'flow_quality')
+
+                        fig_qual = px.line(
+                            df_qual_raw, x='timestamp', y='flow_quality',
+                            title="Optical Flow Quality",
+                            labels={'flow_quality': '质量值'}
+                        )
+                        fig_qual.add_hline(y=100, line_dash="dash", line_color="orange",
+                                           annotation_text="可用阈值 (100)")
+                        st.plotly_chart(fig_qual, use_container_width=True)
+
+                    with col_flow_2:
+                        st.markdown("**累计流量 (Integrated Flow)**")
+                        st.caption("单位: rad。用于判断水平移动趋势。")
+
+                        flow_cols = [c for c in ['flow_x', 'flow_y'] if c in df_clean.columns]
+                        if flow_cols:
+                            # [修改] 对每一列分别处理可能会麻烦，这里直接对 flow_x 去重采样即可
+                            # 因为 flow_x 和 flow_y 通常是同时更新的
+                            df_flow_raw = get_raw_curve(df_clean, 'flow_x')
+
+                            fig_flow = px.line(
+                                df_flow_raw, x='timestamp', y=flow_cols,
+                                title="Flow Integral X/Y",
+                                labels={'value': '累计流量 (rad)'}
+                            )
+                            st.plotly_chart(fig_flow, use_container_width=True)
+                        else:
+                            st.info("未检测到流量数据")
+                else:
+                    # 如果不是 PX4 光流日志，显示提示信息
+                    st.info(
+                        "ℹ️ 当前日志未检测到光流数据 (Optical Flow)")
             with tab3:
                 st.subheader("机身震动水平 (Vibration Levels)")
                 has_vibe_data = 'vibe_x' in df_clean.columns
@@ -385,9 +479,6 @@ if target_path:
                         try:
                             # 1. 占位符策略：先创建一个空容器
                             response_container = st.empty()
-
-                            # 2. 立即显示“思考中”的状态 (填补空窗期)
-                            # 使用 info 框，看起来更显眼，不会是一片白
                             response_container.info("🧠 GLM-4.5 正在阅读时序数据并进行推理，请稍候...")
 
                             client = ZhipuAiClient(api_key=api_key)
@@ -406,12 +497,12 @@ if target_path:
 
                             full_response = ""
 
-                            # 3. 发起请求 (此时界面上还显示着 "正在阅读...")
+                            # 3. 发起请求
                             response = client.chat.completions.create(
                                 model="glm-4.5-flash",
                                 messages=messages,
                                 thinking={
-                                    "type": "enabled",  # bu启用深度思考模式
+                                    "type": "disabled",  # bu启用深度思考模式
                                 },
                                 stream=True,
                                 max_tokens=4096,
@@ -419,22 +510,15 @@ if target_path:
                             )
 
                             # 4. 流式接收
-                            # 这个循环开始执行，意味着 AI 开始说话了
                             for chunk in response:
                                 if chunk.choices and chunk.choices[0].delta.content:
                                     content = chunk.choices[0].delta.content
                                     full_response += content
-
-                                    # 5. 【关键一步】实时覆盖
-                                    # 用累积的文字直接替换掉上面的 response_container.info(...)
-                                    # 视觉上就是：蓝色的“思考中”突然变成了打字机文字，没有任何空白
                                     response_container.markdown(full_response + "▌")
 
-                            # 最后去掉光标
                             response_container.markdown(full_response)
 
                         except Exception as e:
-                            # 如果出错，也在这个容器里显示错误
                             response_container.error(f"AI 分析请求失败: {e}")
 
     except Exception as e:
