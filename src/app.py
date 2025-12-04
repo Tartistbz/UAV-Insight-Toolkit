@@ -17,6 +17,38 @@ else:
     sys.path.append(base_dir)
 from analyzer.ardu_parser import ArduPilotParser
 from analyzer.px4_parser import PX4Parser
+
+MODE_COLORS = {
+    # --- 通用 / ArduPilot 常用 ---
+    'Stabilize': 'rgba(255, 165, 0, 0.1)',   # Orange (手动增稳)
+    'Loiter': 'rgba(0, 0, 255, 0.1)',        # Blue (定点)
+    'PosHold': 'rgba(0, 0, 255, 0.1)',       # Blue (定点)
+    'AltHold': 'rgba(0, 255, 255, 0.1)',     # Cyan (定高)
+    'Auto': 'rgba(0, 255, 0, 0.1)',          # Green (自动任务)
+    'RTL': 'rgba(255, 0, 0, 0.1)',           # Red (返航)
+    'Land': 'rgba(255, 0, 0, 0.1)',          # Red (降落)
+    'Guided': 'rgba(255, 0, 255, 0.1)',      # Magenta (引导/电脑控制)
+    'Manual': 'rgba(128, 128, 128, 0.1)',    # Grey (纯手动)
+    'Acro': 'rgba(255, 255, 0, 0.1)',        # Yellow (特技)
+    'Drift': 'rgba(255, 255, 0, 0.1)',       # Yellow
+    'Sport': 'rgba(255, 255, 0, 0.1)',       # Yellow
+    'Brake': 'rgba(255, 0, 0, 0.1)',         # Red
+    'Throw': 'rgba(255, 165, 0, 0.1)',       # Orange
+
+    # --- PX4 特有模式补充 ---
+    'Mission': 'rgba(0, 255, 0, 0.1)',       # Green (对应 Auto)
+    'Offboard': 'rgba(255, 0, 255, 0.1)',    # Magenta (对应 Guided)
+    'Stabilized': 'rgba(255, 165, 0, 0.1)',  # Orange (对应 Stabilize)
+    'Position': 'rgba(0, 0, 255, 0.1)',      # Blue (对应 PosHold)
+    'Takeoff': 'rgba(255, 165, 0, 0.1)',     # Orange (起飞阶段)
+    'Hold': 'rgba(0, 0, 255, 0.1)',          # Blue (保持)
+    'Follow': 'rgba(0, 255, 255, 0.1)',      # Cyan (跟随)
+    'Precland': 'rgba(255, 0, 0, 0.1)',      # Red (精密降落)
+    'Orbit': 'rgba(255, 0, 255, 0.1)',       # Magenta (盘旋)
+    'Descend': 'rgba(255, 0, 0, 0.2)',       # Red (下降/故障保护)
+    'Rattitude': 'rgba(255, 165, 0, 0.1)',   # Orange
+    'Termination': 'rgba(0, 0, 0, 0.5)',     # Black (停机)
+}
 # --- 页面配置 ---
 st.set_page_config(
     page_title="UAV Insight Toolkit",
@@ -69,6 +101,215 @@ def verify_key(key):
     except Exception as e:
         return False, "ConnectionError", f"SDK 初始化失败: {str(e)}"
 
+def add_flight_mode_background(fig, df):
+    """
+    给 Plotly 图表添加飞行模式背景色块 (智能兼容 ArduPilot 和 PX4)
+    """
+    if 'mode' not in df.columns:
+        return fig
+    
+    # --- 1. 定义翻译字典 ---
+    # ArduCopter 标准映射
+    MAP_ARDU = {
+        0: 'Stabilize', 1: 'Acro', 2: 'AltHold', 3: 'Auto',
+        4: 'Guided', 5: 'Loiter', 6: 'RTL', 7: 'Circle',
+        9: 'Land', 11: 'Drift', 13: 'Sport', 14: 'Flip',
+        15: 'AutoTune', 16: 'PosHold', 17: 'Brake', 18: 'Throw',
+        19: 'Avoid_ADSB', 20: 'Guided_NoGPS', 21: 'Smart_RTL',
+        22: 'FlowHold', 23: 'Follow',24: 'ZigZag',25: 'SystemID',  
+        27: 'Auto_RTL',
+        28: 'Turtle'    
+    }
+    
+    # PX4 标准映射 (基于 vehicle_status.nav_state)
+    MAP_PX4 = {
+            0: 'Manual',  1: 'AltHold',  2: 'PosHold', 3: 'Mission', 4: 'Loiter', 
+            5: 'RTL', 6: 'Acro', 7: 'Offboard',8: 'Stabilized',  9: 'Rattitude',
+            10: 'Takeoff',  11: 'Land',12: 'Descend', 13: 'Termination',14: 'Follow',   
+            15: 'Precland',16: 'Orbit', 17: 'Takeoff',18: 'Land',19: 'Follow', 20: 'Precland',  
+            22: 'Orbit'      
+        }
+
+    # --- 2. 智能切换字典 ---
+    # 默认用 Ardu
+    mode_map = MAP_ARDU
+    # 如果检测到 firmware 列是 PX4，则切换到 PX4 字典
+    if 'firmware' in df.columns and df['firmware'].iloc[0] == 'PX4':
+        mode_map = MAP_PX4
+
+    # --- 3. 数据处理 ---
+    df_mode = df[['timestamp', 'mode']].dropna().reset_index(drop=True)
+    if df_mode.empty:
+        return fig
+
+    df_mode['mode_group'] = (df_mode['mode'] != df_mode['mode'].shift()).cumsum()
+    groups = df_mode.groupby('mode_group')
+    
+    for _, group in groups:
+        start_t = group['timestamp'].min()
+        end_t = group['timestamp'].max()
+        raw_val = group['mode'].iloc[0]
+        
+        # --- 4. 数字转名字 ---
+        try:
+            mode_id = int(float(raw_val))
+            mode_name = mode_map.get(mode_id, f"Mode {mode_id}")
+        except:
+            mode_name = str(raw_val).strip()
+
+        # --- 5. 颜色匹配 ---
+        # 优先全字匹配
+        color = MODE_COLORS.get(mode_name, None)
+        
+        # 其次首字母大写匹配
+        if color is None:
+            color = MODE_COLORS.get(mode_name.capitalize(), None)
+            
+        if color is None:
+            up_name = mode_name.upper()
+            if 'MANUAL' in up_name: color = MODE_COLORS.get('Manual')
+            elif 'MISSION' in up_name: color = MODE_COLORS.get('Auto')     # 绿色
+            elif 'OFFBOARD' in up_name: color = MODE_COLORS.get('Guided')   # 粉/紫色
+            elif 'POSITION' in up_name: color = MODE_COLORS.get('PosHold')  # 蓝色
+            elif 'STABILIZED' in up_name: color = MODE_COLORS.get('Stabilize')
+            elif 'RTL' in up_name or 'RETURN' in up_name: color = MODE_COLORS.get('RTL')
+            elif 'LAND' in up_name: color = MODE_COLORS.get('Land')
+            else:
+                color = 'rgba(200, 200, 200, 0.1)' # 实在找不到就灰色
+
+        # --- 6. 绘图 ---
+        fig.add_vrect(
+            x0=start_t, x1=end_t,
+            fillcolor=color,
+            opacity=1,
+            layer="below",
+            line_width=0,
+            annotation_text=mode_name,
+            annotation_position="top left",
+            annotation_font_size=12,
+            annotation_font_color="black"
+        )
+    return fig
+    """
+    给 Plotly 图表添加飞行模式背景色块 (内置数字转名字映射)
+    """
+    if 'mode' not in df.columns:
+        return fig
+    
+    # --- 1. 定义数字到名字的映射表 (ArduCopter 标准) ---
+    MODE_MAPPING = {
+        0: 'Stabilize', 1: 'Acro', 2: 'AltHold', 3: 'Auto',
+        4: 'Guided', 5: 'Loiter', 6: 'RTL', 7: 'Circle',
+        9: 'Land', 11: 'Drift', 13: 'Sport', 14: 'Flip',
+        15: 'AutoTune', 16: 'PosHold', 17: 'Brake', 18: 'Throw',
+        19: 'Avoid_ADSB', 20: 'Guided_NoGPS', 21: 'Smart_RTL',
+        22: 'FlowHold', 23: 'Follow',24: 'ZigZag',25: 'SystemID',  
+        27: 'Auto_RTL',28: 'Turtle'    
+    }
+
+    # 提取模式并清洗
+    df_mode = df[['timestamp', 'mode']].dropna().reset_index(drop=True)
+    if df_mode.empty:
+        return fig
+
+    # 2. 分段
+    df_mode['mode_group'] = (df_mode['mode'] != df_mode['mode'].shift()).cumsum()
+    groups = df_mode.groupby('mode_group')
+    
+    for _, group in groups:
+        start_t = group['timestamp'].min()
+        end_t = group['timestamp'].max()
+        
+        # --- 3. 核心修复：把数字转成名字 ---
+        raw_val = group['mode'].iloc[0]
+        
+        # 尝试转成整数去查表
+        try:
+            mode_id = int(float(raw_val)) # 处理可能出现的 "4.0" 字符串
+            # 查表，查不到就显示 "Mode 4"
+            mode_name = MODE_MAPPING.get(mode_id, f"Mode {mode_id}") 
+        except:
+            # 如果本身就是字符串名字，就直接用
+            mode_name = str(raw_val).strip()
+
+        # --- 4. 匹配颜色 ---
+        color_key = mode_name.capitalize() 
+        
+        # 备选颜色逻辑：如果字典里没有，但名字里带关键字，也给颜色
+        color = MODE_COLORS.get(mode_name, None) # 先精准匹配
+        if color is None:
+            color = MODE_COLORS.get(color_key, 'rgba(200, 200, 200, 0.1)') # 再首字母大写匹配
+        
+        # --- 5. 绘图 ---
+        fig.add_vrect(
+            x0=start_t, x1=end_t,
+            fillcolor=color,
+            opacity=1,
+            layer="below",
+            line_width=0,
+            annotation_text=mode_name,     # 这里会显示 "Guided" 而不是 "4"
+            annotation_position="top left",
+            annotation_font_size=12,
+            annotation_font_color="black"  # 黑色字体
+        )
+    return fig
+    """
+    给 Plotly 图表添加飞行模式背景色块
+    """
+    if 'mode' not in df.columns:
+            return fig
+        
+    # --- 1. 定义数字到名字的映射表 (ArduCopter 标准) ---
+    # 如果你是固定翼或小车，这个表可能需要微调，但 4 和 9 通常是通用的
+    MODE_MAPPING = {
+        0: 'Stabilize', 1: 'Acro', 2: 'AltHold', 3: 'Auto',
+        4: 'Guided', 5: 'Loiter', 6: 'RTL', 7: 'Circle',
+        9: 'Land', 11: 'Drift', 13: 'Sport', 14: 'Flip',
+        15: 'AutoTune', 16: 'PosHold', 17: 'Brake', 18: 'Throw',
+        20: 'Guided_NoGPS', 21: 'Smart_RTL'
+    }
+    
+    # 1. 提取模式并清洗
+    df_mode = df[['timestamp', 'mode']].dropna().reset_index(drop=True)
+    if df_mode.empty:
+        return fig
+
+    # [调试] 在侧边栏显示我们解析到了哪些模式，帮你找原因
+    # 这样你就能看到是 "STABILIZE" 还是 "0" 还是 "Unknown"
+    with st.sidebar.expander("🛠️ 调试: 飞行模式列表"):
+        unique_modes = df_mode['mode'].unique()
+        st.write(unique_modes)
+
+    # 2. 分段
+    df_mode['mode_group'] = (df_mode['mode'] != df_mode['mode'].shift()).cumsum()
+    groups = df_mode.groupby('mode_group')
+    
+    for _, group in groups:
+        start_t = group['timestamp'].min()
+        end_t = group['timestamp'].max()
+        # 确保转大写，去除空格
+        raw_mode = str(group['mode'].iloc[0]).strip()
+
+        # 如果你的 MODE_COLORS 里的 key 是 "Stabilize" 这种首字母大写的：
+        mode_name = raw_mode.capitalize()
+        
+        # 获取颜色，默认灰色
+        color = MODE_COLORS.get(mode_name, 'rgba(200, 200, 200, 0.1)')
+        
+        # 3. 添加背景矩形
+        fig.add_vrect(
+            x0=start_t, x1=end_t,
+            fillcolor=color,
+            opacity=1,
+            layer="below",
+            line_width=0,
+            # 强制显示文字
+            annotation_text="TEST-" + mode_name,
+            annotation_position="top left", # 尝试放在左上角
+            annotation_font_size=12,
+            annotation_font_color="black"   # 强制黑色字体，防止灰色背景看不清
+        )
+    return fig
 
 # 3. AI 配置区域
 st.sidebar.markdown("---")
@@ -152,6 +393,7 @@ if uploaded_file is not None:
 elif selected_from_folder:
     target_path = os.path.join(data_dir, selected_from_folder)
 
+
 # --- 主界面 ---
 st.title("无人机飞行数据分析看板")
 
@@ -164,77 +406,137 @@ if target_path:
     def load_data(path):
         if path.endswith('.ulg'):
             parser = PX4Parser(path)
+            df = parser.get_dataframe()
+            # [关键] 强制打上 PX4 标签，后续绘图函数会根据这个标签切换字典
+            df['firmware'] = 'PX4' 
         else:
             parser = ArduPilotParser(path)
-        return parser.get_dataframe()
+            df = parser.get_dataframe()
+            # [关键] 打上 Ardu 标签
+            df['firmware'] = 'Ardu'
+        return df
 
 
     def generate_ai_prompt(df):
-        """
-        [升级版] 生成包含时序特征的详细摘要
-        """
-        # 1. 基础统计
-        duration = df['timestamp'].max() - df['timestamp'].min()
-        max_alt = df['relative_alt'].max() if 'relative_alt' in df else 0
+            """
+            不再只按时间间隔采样，而是优先保留：模式切换点、震动峰值点、姿态误差峰值点。
+            """
+            # --- 1. 准备映射字典 ---
+            # ArduPilot
+            MAP_ARDU = {
+                0: 'Stabilize', 1: 'Acro', 2: 'AltHold', 3: 'Auto', 4: 'Guided', 
+                5: 'Loiter', 6: 'RTL', 7: 'Circle', 9: 'Land', 
+                16: 'PosHold', 17: 'Brake', 21: 'Smart_RTL', 23: 'Follow'
+            }
+            # PX4
+            MAP_PX4 = {
+                0: 'Manual',  1: 'AltHold',  2: 'PosHold', 3: 'Mission', 4: 'Loiter', 
+                5: 'RTL', 6: 'Acro', 7: 'Offboard',8: 'Stabilized',  9: 'Rattitude',
+                10: 'Takeoff',  11: 'Land',12: 'Descend', 13: 'Termination',14: 'Follow',   
+                15: 'Precland',16: 'Orbit', 17: 'Takeoff',18: 'Land',19: 'Follow', 20: 'Precland',  
+                22: 'Orbit'   
+            }
 
-        summary = f"【飞行概况】\n飞行时长: {duration:.1f}秒\n最大相对高度: {max_alt:.1f}米\n"
+            # 确定固件类型
+            is_px4 = False
+            if 'firmware' in df.columns and df['firmware'].iloc[0] == 'PX4':
+                is_px4 = True
+            
+            target_map = MAP_PX4 if is_px4 else MAP_ARDU
 
-        # 2. 震动深度分析 (增加时间上下文)
-        if 'vibe_x' in df:
-            # 找到震动最大的那一行的索引
-            max_vibe_idx = df['vibe_x'].idxmax()
-            max_vibe_row = df.loc[max_vibe_idx]
+            # --- 2. 智能关键帧抽取 (Smart Resampling) ---
+            # 目标：凑够约 30-40 行数据
+            indices = set()
+            
+            # A. 必选：模式切换的时刻 (Mode Switches)
+            # shift(1) 比较前后两行，不一样的就是切换点
+            mode_change_indices = df.index[df['mode'] != df['mode'].shift(1)].tolist()
+            indices.update(mode_change_indices)
+            # B. 必选：震动最大的前 3 个时刻 (Vibration Peaks)
+            if 'vibe_x' in df:
+                vibe_peak_indices = df['vibe_x'].nlargest(3).index.tolist()
+                indices.update(vibe_peak_indices)
+            # C. 必选：姿态误差最大的前 3 个时刻 (PID Error Peaks)
+            # 如果有期望值和实际值，计算差值并找最大
+            if 'rate_roll' in df and 'rate_roll_des' in df:
+                # 计算临时的误差列
+                err_series = (df['rate_roll_des'] - df['rate_roll']).abs()
+                err_peak_indices = err_series.nlargest(3).index.tolist()
+                indices.update(err_peak_indices)
+            # D. 补充：基础时间轴 (Base Timeline)
+            # 为了保持时间连贯性，无论发生什么，每隔 5% 的进度取一个点
+            step = max(1, len(df) // 15) # 约取 15 个均匀点
+            uniform_indices = df.iloc[::step].index.tolist()
+            indices.update(uniform_indices)
+            # E. 必选：起飞和结束
+            indices.add(df.index[0])
+            indices.add(df.index[-1])
+            # --- 3. 整理采样数据 ---
+            # 将所有索引排序，去除重复，提取数据
+            sorted_indices = sorted(list(indices))
+            sampled_df = df.loc[sorted_indices].copy()
+            # 计算相对时间
+            start_time = df['timestamp'].min()
+            sampled_df['t_rel'] = sampled_df['timestamp'] - start_time
+            # --- 4. 生成文本报告 ---
+            duration = df['timestamp'].max() - df['timestamp'].min()
+            max_alt = df['relative_alt'].max() if 'relative_alt' in df else 0
+            summary = "【1. 飞行概况】\n"
+            summary += f"- 固件: {'PX4' if is_px4 else 'ArduPilot'}\n"
+            summary += f"- 时长: {duration:.1f}s | 高度: {max_alt:.1f}m\n"
+            
+            if 'vibe_x' in df:
+                max_v = df['vibe_x'].max()
+                summary += f"- 最大震动: {max_v:.2f} (阈值30)\n"
 
-            max_vibe = max_vibe_row['vibe_x']
-            max_vibe_time = max_vibe_row['timestamp'] - df['timestamp'].min()  # 相对时间
-            max_vibe_alt = max_vibe_row['relative_alt'] if 'relative_alt' in max_vibe_row else 0
+            summary += "\n【2. 关键事件快照 (智能抽取)】\n"
+            summary += "说明: 此表已自动筛选出 [模式切换]、[最大震动]、[最大误差] 的时刻。\n"
+            summary += "Time(s) | Mode       | Alt(m) | Roll(°) | Vibe(m/s²) | Event/Reason\n"
+            summary += "--------|------------|--------|---------|------------|-------------\n"
 
-            avg_vibe = df[['vibe_x', 'vibe_y', 'vibe_z']].mean().mean()
+            last_mode = None
+            
+            for idx, row in sampled_df.iterrows():
+                # A. 基础数据格式化
+                t = f"{row['t_rel']:.1f}"
+                
+                # 模式名解析
+                raw_mode = row['mode']
+                try:
+                    mode_id = int(float(raw_mode))
+                    mode_str = target_map.get(mode_id, f"M{mode_id}")
+                except:
+                    mode_str = str(raw_mode).strip()
+                mode_disp = mode_str[:8].ljust(10)
+                
+                alt = f"{row['relative_alt']:.1f}".rjust(6) if 'relative_alt' in row else "   0.0"
+                roll = f"{row['roll']:.1f}".rjust(7) if 'roll' in row else "    0.0"
+                vibe = f"{row['vibe_x']:.1f}".rjust(10) if 'vibe_x' in row else "       0.0"
+                
+                # B. 智能标注原因 (为什么这一行被选进来了？)
+                reasons = []
+                
+                # 原因1: 模式切换
+                if last_mode is not None and mode_str != last_mode:
+                    reasons.append(f"🔄Switch")
+                last_mode = mode_str
+                
+                # 原因2: 震动过大 (例如超过25) 或 接近全场最大值
+                if 'vibe_x' in df:
+                    if row['vibe_x'] > 25: reasons.append("⚠️HighVibe")
+                    # 如果这个点的索引在刚才计算的震动峰值列表里
+                    if idx in vibe_peak_indices: reasons.append("📈MaxVibe")
 
-            clip_cols = [c for c in ['clip_0', 'clip_1', 'clip_2'] if c in df]
-            total_clips = df[clip_cols].max().sum() if clip_cols else 0
+                # 原因3: 误差过大 (如果刚才算了误差)
+                if 'rate_roll' in df and idx in err_peak_indices:
+                    reasons.append("❌MaxErr")
 
-            summary += f"\n【震动事件分析】\n"
-            summary += f"- 峰值时刻: T+{max_vibe_time:.1f}秒 (高度 {max_vibe_alt:.1f}m)\n"
-            summary += f"- 峰值强度: {max_vibe:.2f} m/s² (阈值30)\n"
-            summary += f"- 平均强度: {avg_vibe:.2f} m/s²\n"
-            summary += f"- 削顶(Clipping): {total_clips}次\n"
-            # [新增] PID 详细统计
-        if 'rate_roll' in df and 'rate_roll_des' in df:
-            # 计算误差 (Error = Desired - Actual)
-            # 使用 abs().mean() 计算平均绝对误差 (MAE)
-            roll_mae = (df['rate_roll_des'] - df['rate_roll']).abs().mean()
-            pitch_mae = (df['rate_pitch_des'] - df['rate_pitch']).abs().mean()
-            yaw_mae = (df['rate_yaw_des'] - df['rate_yaw']).abs().mean()
+                # 如果没特殊原因，就是时间轴采样
+                event_mark = " ".join(reasons) if reasons else "⏱️Timer"
 
-            summary += f"\n【PID控制质量】\n"
-            summary += f"Roll轴平均跟踪误差: {roll_mae:.2f} deg/s\n"
-            summary += f"Pitch轴平均跟踪误差: {pitch_mae:.2f} deg/s\n"
-            summary += f"Yaw轴平均跟踪误差: {yaw_mae:.2f} deg/s\n"
-            summary += "(提示: 误差越小越好。如果误差大且伴随震荡，可能是P/D参数过大；如果误差大且滞后，可能是P/I参数过小。)\n"
+                summary += f"{t.ljust(7)} | {mode_disp} | {alt} | {roll} | {vibe} | {event_mark}\n"
 
-        # 3. 构建时序趋势 (Downsampling)
-        # 为了不撑爆 token，我们把整个日志压缩成约 20-30 个关键点
-        # 例如：总共 1000 行，我们每隔 50 行取一个点
-        step = max(1, len(df) // 30)
-        sampled_df = df.iloc[::step].copy()
-
-        # 将绝对时间戳转换为相对时间 (T+xx秒)
-        start_time = df['timestamp'].min()
-        sampled_df['time_rel'] = sampled_df['timestamp'] - start_time
-
-        summary += "\n【飞行趋势快照 (时间,高度,震动,横滚)】\n"
-        summary += "Time(s), Alt(m), Vibe(m/s²), Roll(deg)\n"
-
-        for _, row in sampled_df.iterrows():
-            # 这里的字段名要和 df_clean 里的一致
-            t = f"{row['time_rel']:.1f}"
-            a = f"{row['relative_alt']:.1f}" if 'relative_alt' in row else "0"
-            v = f"{row['vibe_x']:.1f}" if 'vibe_x' in row else "0"
-            r = f"{row['roll']:.1f}" if 'roll' in row else "0"
-            summary += f"{t}, {a}, {v}, {r}\n"
-
-        return summary
+            return summary
 
 
     try:
@@ -246,19 +548,14 @@ if target_path:
             # --- 2. 数据清洗 ---
             df_clean = df_raw.set_index('timestamp').ffill().reset_index()
             if 'alt' in df_clean.columns:
-                # 方案 A: 有 GPS，使用 GPS 高度 (AMSL) 计算相对高度
                 home_alt = df_clean['alt'].iloc[:50].mean()
                 df_clean['relative_alt'] = df_clean['alt'] - home_alt
 
             elif 'loc_z' in df_clean.columns:
-                # 方案 B: 没 GPS，使用局部位置 Z (NED 坐标系)
-                # 注意: PX4 的 Local Z 轴向下为正，所以高度 = -Z
-                # 我们也取个初始偏移量，防止数据没归零
                 start_z = df_clean['loc_z'].iloc[:50].mean()
                 df_clean['relative_alt'] = -(df_clean['loc_z'] - start_z)
 
             else:
-                # 方案 C: 啥都没有
                 df_clean['relative_alt'] = 0
 
             # --- 3. 关键指标 ---
@@ -282,6 +579,7 @@ if target_path:
                         y=['roll', 'pitch'],
                         labels={'value': '角度 (deg)', 'timestamp': '时间 (s)'}
                     )
+                    add_flight_mode_background(fig_att, df_clean)
                     st.plotly_chart(fig_att, use_container_width=True)
                 else:
                     st.warning("未检测到姿态数据")
@@ -391,6 +689,7 @@ if target_path:
                     )
                     fig_vibe.add_hline(y=30, line_dash="dash", line_color="red", annotation_text="危险阈值")
                     fig_vibe.add_hline(y=15, line_dash="dash", line_color="orange", annotation_text="警告阈值")
+                    add_flight_mode_background(fig_vibe, df_clean)
                     st.plotly_chart(fig_vibe, use_container_width=True)
 
                     if has_clip_data:
@@ -456,6 +755,7 @@ if target_path:
 
                     # 允许局部缩放
                     fig_pid.update_traces(line=dict(width=1.5))
+                    add_flight_mode_background(fig_pid, df_clean)
                     st.plotly_chart(fig_pid, use_container_width=True)
 
                 else:

@@ -7,7 +7,7 @@ from .parser_base import LogParser
 class PX4Parser(LogParser):
     """
     [子类] PX4 ULog (.ulg) 解析器 (全功能版)
-    支持: 姿态, GPS, 局部位置, PID, 光流, 震动(计算), 削顶
+    支持: 姿态, GPS, 局部位置, PID, 光流, 震动(计算), 削顶, 飞行模式
     """
 
     def load(self) -> bool:
@@ -30,6 +30,9 @@ class PX4Parser(LogParser):
             'vehicle_local_position': ['timestamp', 'x', 'y', 'z'],
             'vehicle_angular_velocity': ['timestamp', 'xyz[0]', 'xyz[1]', 'xyz[2]'],
             'vehicle_rates_setpoint': ['timestamp', 'roll', 'pitch', 'yaw'],
+
+            # [新增] 飞行模式源数据 (PX4 中模式存储在 vehicle_status 的 nav_state 字段)
+            'vehicle_status': ['timestamp', 'nav_state'],
 
             # [新增] 震动源数据: 原始加速度
             'sensor_combined': ['timestamp', 'accelerometer_m_s2[0]', 'accelerometer_m_s2[1]', 'accelerometer_m_s2[2]'],
@@ -71,17 +74,20 @@ class PX4Parser(LogParser):
                 df_temp = pd.DataFrame(data.data)
                 df_temp['timestamp'] /= 1e6  # us -> s
 
+                # [新增] 特殊处理: 重命名 nav_state 为 mode
+                if topic == 'vehicle_status':
+                    df_temp = df_temp.rename(columns={'nav_state': 'mode'})
+
                 if topic == flow_topic:
                     df_temp = df_temp.rename(columns=flow_field_map)
                     cols = ['timestamp'] + list(flow_field_map.values())
                     df_temp = df_temp[[c for c in cols if c in df_temp.columns]]
 
-                # 兼容 IMU Clipping 字段名 (有时可能是单数 accel_clipping)
+                # 兼容 IMU Clipping 字段名
                 if topic == 'vehicle_imu_status':
-                    # 如果找不到数组形式，尝试找单数形式
                     if 'accel_clipping[0]' not in df_temp.columns and 'accel_clipping' in df_temp.columns:
                         df_temp['accel_clipping[0]'] = df_temp['accel_clipping']
-                        df_temp['accel_clipping[1]'] = 0  # 简化处理
+                        df_temp['accel_clipping[1]'] = 0
                         df_temp['accel_clipping[2]'] = 0
 
                 dfs[topic] = df_temp
@@ -100,12 +106,17 @@ class PX4Parser(LogParser):
         main_df['pitch'] = np.degrees(np.arcsin(np.clip(2 * (w * y - z * x), -1, 1)))
         main_df['yaw'] = np.degrees(np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z)))
         main_df = main_df[['timestamp', 'roll', 'pitch', 'yaw']]
+        
+        # [新增] 合并飞行模式 (Mode)
+        if 'vehicle_status' in dfs:
+            # 使用 nearest 匹配，因为模式切换频率比姿态低得多
+            main_df = pd.merge_asof(main_df, dfs['vehicle_status'][['timestamp', 'mode']], on='timestamp')
 
         # 合并 GPS
         if 'vehicle_gps_position' in dfs:
             gps = dfs['vehicle_gps_position']
-            gps['lat'] /= 1e7;
-            gps['lon'] /= 1e7;
+            gps['lat'] /= 1e7
+            gps['lon'] /= 1e7
             gps['alt'] /= 1e3
             main_df = pd.merge_asof(main_df, gps[['timestamp', 'lat', 'lon', 'alt']], on='timestamp')
 
@@ -133,25 +144,17 @@ class PX4Parser(LogParser):
             main_df = pd.merge_asof(main_df, dfs[flow_topic], on='timestamp')
 
         # [关键] 计算震动 (Vibration)
-        # 逻辑: 取 sensor_combined 的加速度，计算滑动窗口标准差 (Rolling Std)
         if 'sensor_combined' in dfs:
             acc = dfs['sensor_combined']
-            # 定义窗口大小 (例如 0.5秒左右，假设 50Hz 数据，取 25 个点)
             window_size = 25
-
-            # 计算标准差 (VibeX/Y/Z)
-            # 注意：这里计算的是 "震动能量"，单位 m/s^2，与 ArduPilot Vibe 定义一致
             acc['vibe_x'] = acc['accelerometer_m_s2[0]'].rolling(window_size).std().fillna(0)
             acc['vibe_y'] = acc['accelerometer_m_s2[1]'].rolling(window_size).std().fillna(0)
             acc['vibe_z'] = acc['accelerometer_m_s2[2]'].rolling(window_size).std().fillna(0)
-
             main_df = pd.merge_asof(main_df, acc[['timestamp', 'vibe_x', 'vibe_y', 'vibe_z']], on='timestamp')
 
         # [关键] 合并削顶 (Clipping)
         if 'vehicle_imu_status' in dfs:
             clip = dfs['vehicle_imu_status']
-            # 重命名为 standard columns
-            # 优先使用数组列，如果之前做了兼容处理
             clip_cols_map = {}
             if 'accel_clipping[0]' in clip.columns:
                 clip_cols_map = {'accel_clipping[0]': 'clip_0', 'accel_clipping[1]': 'clip_1',
