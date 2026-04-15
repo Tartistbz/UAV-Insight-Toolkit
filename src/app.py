@@ -1,5 +1,6 @@
 import streamlit as st
 import plotly.express as px
+import pandas as pd
 import os
 import sys
 import tempfile
@@ -79,6 +80,8 @@ def get_raw_curve(df, col_name):
     mask = df[col_name].diff().fillna(1) != 0
     return df[mask]
 
+
+
 # 2. 定义验证函数
 def verify_key(key):
     """验证 Key 的格式和有效性"""
@@ -100,6 +103,56 @@ def verify_key(key):
         return True, "Success", key
     except Exception as e:
         return False, "ConnectionError", f"SDK 初始化失败: {str(e)}"
+def generate_dynamic_summary(df_slice, selected_columns):
+    if df_slice.empty or not selected_columns:
+        return "数据为空，请调整筛选条件。"
+    duration = df_slice['timestamp'].max() - df_slice['timestamp'].min()
+    summary = f"【飞行片段分析】\n- 时间跨度: {duration:.1f}s\n- 关键维度统计:\n"
+    for col in selected_columns:
+        if col in df_slice.columns:
+            summary += f"  * {col}: 范围[{df_slice[col].min():.2f}, {df_slice[col].max():.2f}], 均值:{df_slice[col].mean():.2f}\n"
+    summary += "\n【采样数据】\n"
+    step = max(1, len(df_slice) // 15)
+    summary += df_slice[['timestamp'] + selected_columns].iloc[::step].to_string(index=False)
+    return summary
+def render_interactive_ai_chat(df, api_key, key_suffix=""):
+    col_config, col_chat = st.columns([1, 2])
+    
+    with col_config:
+        st.info("🎯 **第一步：定制分析上下文**")
+        numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and c not in ['timestamp', 'mode']]
+        selected_cols = st.multiselect("选择分析维度:", options=numeric_cols, default=numeric_cols[:3], key=f"cols_{key_suffix}")
+        t_min, t_max = float(df['timestamp'].min()), float(df['timestamp'].max())
+        time_range = st.slider("截取时间段 (秒):", t_min, t_max, (t_min, t_max), key=f"range_{key_suffix}")
+        filtered_df = df[(df['timestamp'] >= time_range[0]) & (df['timestamp'] <= time_range[1])]
+        st.success(f"已选取 {len(filtered_df)} 行数据")
+
+    with col_chat:
+        st.info("🤖 **第二步：针对该片段提问**")
+        hist_key = f"chat_history{key_suffix}"
+        if hist_key not in st.session_state: st.session_state[hist_key] = []
+        for msg in st.session_state[hist_key]:
+            with st.chat_message(msg["role"]): st.markdown(msg["content"])
+
+        user_input = st.chat_input("请提问...", key=f"input_{key_suffix}")
+        if user_input and api_key:
+            st.session_state[hist_key].append({"role": "user", "content": user_input})
+            with st.chat_message("user"): st.markdown(user_input)
+            with st.chat_message("assistant"):
+                msg_placeholder = st.empty()
+                try:
+                    data_context = generate_dynamic_summary(filtered_df, selected_cols)
+                    client = ZhipuAiClient(api_key=api_key)
+                    messages = [{"role": "system", "content": "你是一位无人机专家。"},
+                                {"role": "user", "content": f"数据摘要：\n{data_context}\n\n问题：{user_input}"}]
+                    full_res = ""
+                    for chunk in client.chat.completions.create(model="glm-4.5-flash", messages=messages, stream=True):
+                        if chunk.choices[0].delta.content:
+                            full_res += chunk.choices[0].delta.content
+                            msg_placeholder.markdown(full_res + "▌")
+                    msg_placeholder.markdown(full_res)
+                    st.session_state[hist_key].append({"role": "assistant", "content": full_res})
+                except Exception as e: msg_placeholder.error(f"分析失败: {e}")
 
 def add_flight_mode_background(fig, df):
     """
@@ -190,127 +243,6 @@ def add_flight_mode_background(fig, df):
             annotation_font_color="black"
         )
     return fig
-    """
-    给 Plotly 图表添加飞行模式背景色块 (内置数字转名字映射)
-    """
-    if 'mode' not in df.columns:
-        return fig
-    
-    # --- 1. 定义数字到名字的映射表 (ArduCopter 标准) ---
-    MODE_MAPPING = {
-        0: 'Stabilize', 1: 'Acro', 2: 'AltHold', 3: 'Auto',
-        4: 'Guided', 5: 'Loiter', 6: 'RTL', 7: 'Circle',
-        9: 'Land', 11: 'Drift', 13: 'Sport', 14: 'Flip',
-        15: 'AutoTune', 16: 'PosHold', 17: 'Brake', 18: 'Throw',
-        19: 'Avoid_ADSB', 20: 'Guided_NoGPS', 21: 'Smart_RTL',
-        22: 'FlowHold', 23: 'Follow',24: 'ZigZag',25: 'SystemID',  
-        27: 'Auto_RTL',28: 'Turtle'    
-    }
-
-    # 提取模式并清洗
-    df_mode = df[['timestamp', 'mode']].dropna().reset_index(drop=True)
-    if df_mode.empty:
-        return fig
-
-    # 2. 分段
-    df_mode['mode_group'] = (df_mode['mode'] != df_mode['mode'].shift()).cumsum()
-    groups = df_mode.groupby('mode_group')
-    
-    for _, group in groups:
-        start_t = group['timestamp'].min()
-        end_t = group['timestamp'].max()
-        
-        # --- 3. 核心修复：把数字转成名字 ---
-        raw_val = group['mode'].iloc[0]
-        
-        # 尝试转成整数去查表
-        try:
-            mode_id = int(float(raw_val)) # 处理可能出现的 "4.0" 字符串
-            # 查表，查不到就显示 "Mode 4"
-            mode_name = MODE_MAPPING.get(mode_id, f"Mode {mode_id}") 
-        except:
-            # 如果本身就是字符串名字，就直接用
-            mode_name = str(raw_val).strip()
-
-        # --- 4. 匹配颜色 ---
-        color_key = mode_name.capitalize() 
-        
-        # 备选颜色逻辑：如果字典里没有，但名字里带关键字，也给颜色
-        color = MODE_COLORS.get(mode_name, None) # 先精准匹配
-        if color is None:
-            color = MODE_COLORS.get(color_key, 'rgba(200, 200, 200, 0.1)') # 再首字母大写匹配
-        
-        # --- 5. 绘图 ---
-        fig.add_vrect(
-            x0=start_t, x1=end_t,
-            fillcolor=color,
-            opacity=1,
-            layer="below",
-            line_width=0,
-            annotation_text=mode_name,     # 这里会显示 "Guided" 而不是 "4"
-            annotation_position="top left",
-            annotation_font_size=12,
-            annotation_font_color="black"  # 黑色字体
-        )
-    return fig
-    """
-    给 Plotly 图表添加飞行模式背景色块
-    """
-    if 'mode' not in df.columns:
-            return fig
-        
-    # --- 1. 定义数字到名字的映射表 (ArduCopter 标准) ---
-    # 如果你是固定翼或小车，这个表可能需要微调，但 4 和 9 通常是通用的
-    MODE_MAPPING = {
-        0: 'Stabilize', 1: 'Acro', 2: 'AltHold', 3: 'Auto',
-        4: 'Guided', 5: 'Loiter', 6: 'RTL', 7: 'Circle',
-        9: 'Land', 11: 'Drift', 13: 'Sport', 14: 'Flip',
-        15: 'AutoTune', 16: 'PosHold', 17: 'Brake', 18: 'Throw',
-        20: 'Guided_NoGPS', 21: 'Smart_RTL'
-    }
-    
-    # 1. 提取模式并清洗
-    df_mode = df[['timestamp', 'mode']].dropna().reset_index(drop=True)
-    if df_mode.empty:
-        return fig
-
-    # [调试] 在侧边栏显示我们解析到了哪些模式，帮你找原因
-    # 这样你就能看到是 "STABILIZE" 还是 "0" 还是 "Unknown"
-    with st.sidebar.expander("🛠️ 调试: 飞行模式列表"):
-        unique_modes = df_mode['mode'].unique()
-        st.write(unique_modes)
-
-    # 2. 分段
-    df_mode['mode_group'] = (df_mode['mode'] != df_mode['mode'].shift()).cumsum()
-    groups = df_mode.groupby('mode_group')
-    
-    for _, group in groups:
-        start_t = group['timestamp'].min()
-        end_t = group['timestamp'].max()
-        # 确保转大写，去除空格
-        raw_mode = str(group['mode'].iloc[0]).strip()
-
-        # 如果你的 MODE_COLORS 里的 key 是 "Stabilize" 这种首字母大写的：
-        mode_name = raw_mode.capitalize()
-        
-        # 获取颜色，默认灰色
-        color = MODE_COLORS.get(mode_name, 'rgba(200, 200, 200, 0.1)')
-        
-        # 3. 添加背景矩形
-        fig.add_vrect(
-            x0=start_t, x1=end_t,
-            fillcolor=color,
-            opacity=1,
-            layer="below",
-            line_width=0,
-            # 强制显示文字
-            annotation_text="TEST-" + mode_name,
-            annotation_position="top left", # 尝试放在左上角
-            annotation_font_size=12,
-            annotation_font_color="black"   # 强制黑色字体，防止灰色背景看不清
-        )
-    return fig
-
 # 3. AI 配置区域
 st.sidebar.markdown("---")
 st.sidebar.subheader("🤖 AI 配置")
@@ -415,129 +347,6 @@ if target_path:
             # [关键] 打上 Ardu 标签
             df['firmware'] = 'Ardu'
         return df
-
-
-    def generate_ai_prompt(df):
-            """
-            不再只按时间间隔采样，而是优先保留：模式切换点、震动峰值点、姿态误差峰值点。
-            """
-            # --- 1. 准备映射字典 ---
-            # ArduPilot
-            MAP_ARDU = {
-                0: 'Stabilize', 1: 'Acro', 2: 'AltHold', 3: 'Auto', 4: 'Guided', 
-                5: 'Loiter', 6: 'RTL', 7: 'Circle', 9: 'Land', 
-                16: 'PosHold', 17: 'Brake', 21: 'Smart_RTL', 23: 'Follow'
-            }
-            # PX4
-            MAP_PX4 = {
-                0: 'Manual',  1: 'AltHold',  2: 'PosHold', 3: 'Mission', 4: 'Loiter', 
-                5: 'RTL', 6: 'Acro', 7: 'Offboard',8: 'Stabilized',  9: 'Rattitude',
-                10: 'Takeoff',  11: 'Land',12: 'Descend', 13: 'Termination',14: 'Follow',   
-                15: 'Precland',16: 'Orbit', 17: 'Takeoff',18: 'Land',19: 'Follow', 20: 'Precland',  
-                22: 'Orbit'   
-            }
-
-            # 确定固件类型
-            is_px4 = False
-            if 'firmware' in df.columns and df['firmware'].iloc[0] == 'PX4':
-                is_px4 = True
-            
-            target_map = MAP_PX4 if is_px4 else MAP_ARDU
-
-            # --- 2. 智能关键帧抽取 (Smart Resampling) ---
-            # 目标：凑够约 30-40 行数据
-            indices = set()
-            
-            # A. 必选：模式切换的时刻 (Mode Switches)
-            # shift(1) 比较前后两行，不一样的就是切换点
-            mode_change_indices = df.index[df['mode'] != df['mode'].shift(1)].tolist()
-            indices.update(mode_change_indices)
-            # B. 必选：震动最大的前 3 个时刻 (Vibration Peaks)
-            if 'vibe_x' in df:
-                vibe_peak_indices = df['vibe_x'].nlargest(3).index.tolist()
-                indices.update(vibe_peak_indices)
-            # C. 必选：姿态误差最大的前 3 个时刻 (PID Error Peaks)
-            # 如果有期望值和实际值，计算差值并找最大
-            if 'rate_roll' in df and 'rate_roll_des' in df:
-                # 计算临时的误差列
-                err_series = (df['rate_roll_des'] - df['rate_roll']).abs()
-                err_peak_indices = err_series.nlargest(3).index.tolist()
-                indices.update(err_peak_indices)
-            # D. 补充：基础时间轴 (Base Timeline)
-            # 为了保持时间连贯性，无论发生什么，每隔 5% 的进度取一个点
-            step = max(1, len(df) // 15) # 约取 15 个均匀点
-            uniform_indices = df.iloc[::step].index.tolist()
-            indices.update(uniform_indices)
-            # E. 必选：起飞和结束
-            indices.add(df.index[0])
-            indices.add(df.index[-1])
-            # --- 3. 整理采样数据 ---
-            # 将所有索引排序，去除重复，提取数据
-            sorted_indices = sorted(list(indices))
-            sampled_df = df.loc[sorted_indices].copy()
-            # 计算相对时间
-            start_time = df['timestamp'].min()
-            sampled_df['t_rel'] = sampled_df['timestamp'] - start_time
-            # --- 4. 生成文本报告 ---
-            duration = df['timestamp'].max() - df['timestamp'].min()
-            max_alt = df['relative_alt'].max() if 'relative_alt' in df else 0
-            summary = "【1. 飞行概况】\n"
-            summary += f"- 固件: {'PX4' if is_px4 else 'ArduPilot'}\n"
-            summary += f"- 时长: {duration:.1f}s | 高度: {max_alt:.1f}m\n"
-            
-            if 'vibe_x' in df:
-                max_v = df['vibe_x'].max()
-                summary += f"- 最大震动: {max_v:.2f} (阈值30)\n"
-
-            summary += "\n【2. 关键事件快照 (智能抽取)】\n"
-            summary += "说明: 此表已自动筛选出 [模式切换]、[最大震动]、[最大误差] 的时刻。\n"
-            summary += "Time(s) | Mode       | Alt(m) | Roll(°) | Vibe(m/s²) | Event/Reason\n"
-            summary += "--------|------------|--------|---------|------------|-------------\n"
-
-            last_mode = None
-            
-            for idx, row in sampled_df.iterrows():
-                # A. 基础数据格式化
-                t = f"{row['t_rel']:.1f}"
-                
-                # 模式名解析
-                raw_mode = row['mode']
-                try:
-                    mode_id = int(float(raw_mode))
-                    mode_str = target_map.get(mode_id, f"M{mode_id}")
-                except:
-                    mode_str = str(raw_mode).strip()
-                mode_disp = mode_str[:8].ljust(10)
-                
-                alt = f"{row['relative_alt']:.1f}".rjust(6) if 'relative_alt' in row else "   0.0"
-                roll = f"{row['roll']:.1f}".rjust(7) if 'roll' in row else "    0.0"
-                vibe = f"{row['vibe_x']:.1f}".rjust(10) if 'vibe_x' in row else "       0.0"
-                
-                # B. 智能标注原因 (为什么这一行被选进来了？)
-                reasons = []
-                
-                # 原因1: 模式切换
-                if last_mode is not None and mode_str != last_mode:
-                    reasons.append(f"🔄Switch")
-                last_mode = mode_str
-                
-                # 原因2: 震动过大 (例如超过25) 或 接近全场最大值
-                if 'vibe_x' in df:
-                    if row['vibe_x'] > 25: reasons.append("⚠️HighVibe")
-                    # 如果这个点的索引在刚才计算的震动峰值列表里
-                    if idx in vibe_peak_indices: reasons.append("📈MaxVibe")
-
-                # 原因3: 误差过大 (如果刚才算了误差)
-                if 'rate_roll' in df and idx in err_peak_indices:
-                    reasons.append("❌MaxErr")
-
-                # 如果没特殊原因，就是时间轴采样
-                event_mark = " ".join(reasons) if reasons else "⏱️Timer"
-
-                summary += f"{t.ljust(7)} | {mode_disp} | {alt} | {roll} | {vibe} | {event_mark}\n"
-
-            return summary
-
 
     try:
         df_raw = load_data(target_path)
@@ -760,70 +569,19 @@ if target_path:
 
                 else:
                     st.warning("⚠️ 当前日志未包含 RATE 消息。请检查飞控参数 LOG_BITMASK。")
-            # --- [AI 智能分析模块] ---
+            # --- [AI 智能分析模块]【已取消】 ---
+            # --- [交互式AI聊天界面] ---
+            # 1. 无论有没有 Key，都先显示大标题和分割线
             st.markdown("---")
-            st.subheader("🤖 AI 飞行诊断 (Powered by GLM-4.5)")
-
-            col_ai_1, col_ai_2 = st.columns([1, 2])
-
-            with col_ai_1:
-                st.info("📊 **发送给 AI 的数据摘要:**")
-                prompt_summary = generate_ai_prompt(df_clean)
-                st.code(prompt_summary, language="text")
-
-            with col_ai_2:
-                if st.button("🚀 开始 AI 诊断"):
-                    if not api_key:
-                        st.error("请先在侧边栏配置并验证 API Key！")
-                    else:
-                        try:
-                            # 1. 占位符策略：先创建一个空容器
-                            response_container = st.empty()
-                            response_container.info("🧠 GLM-4.5 正在阅读时序数据并进行推理，请稍候...")
-
-                            client = ZhipuAiClient(api_key=api_key)
-
-                            messages = [
-                                {"role": "system",
-                                 "content": """你是一位专业的无人机飞控专家。用户会提供一份包含“统计摘要”和“时序趋势快照”的飞行数据。
-                                    请基于这些数据进行深度推理，而不仅仅是复述数字。
-                                    分析要求：
-                                    1. **结合时空上下文**：分析震动峰值发生的时间点。
-                                    2. **关联分析**：观察“飞行趋势快照”，看震动变大时，姿态（Roll）或高度（Alt）是否有剧烈变化？
-                                    3. **给出专业判断**。
-                                    请输出格式清晰的诊断报告。"""},
-                                {"role": "user", "content": prompt_summary}
-                            ]
-
-                            full_response = ""
-
-                            # 3. 发起请求
-                            response = client.chat.completions.create(
-                                model="glm-4.5-flash",
-                                messages=messages,
-                                thinking={
-                                    "type": "disabled",  # bu启用深度思考模式
-                                },
-                                stream=True,
-                                max_tokens=4096,
-                                temperature=0.7
-                            )
-
-                            # 4. 流式接收
-                            for chunk in response:
-                                if chunk.choices and chunk.choices[0].delta.content:
-                                    content = chunk.choices[0].delta.content
-                                    full_response += content
-                                    response_container.markdown(full_response + "▌")
-
-                            response_container.markdown(full_response)
-
-                        except Exception as e:
-                            response_container.error(f"AI 分析请求失败: {e}")
+            st.subheader("💬 交互式 AI 深度分析")
+            if api_key:
+                # 调用交互式聊天界面
+                render_interactive_ai_chat(df_clean, api_key, key_suffix="_main")
+            else:
+                st.warning("⚠️ 请先在侧边栏配置并验证API Key以使用交互式AI分析功能")
 
     except Exception as e:
         st.error(f"解析出错: {e}")
         st.code(str(e))
-
 else:
     st.info("请在左侧选择一个日志文件开始分析。")
